@@ -9,7 +9,7 @@ A simple, automated script to deploy a direct tunnel between Iran (Client) and K
 Run the following command on both your **Iranian** and **External** servers:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ChownYourLife/paqet-tunnel/master/deploy-tunnel.sh -o deploy.sh && chmod +x deploy.sh && sudo ./deploy.sh
+curl -fsSL https://raw.githubusercontent.com/diyakou/paqet-tunnel/master/deploy-tunnel.sh -o deploy.sh && chmod +x deploy.sh && sudo ./deploy.sh
 ```
 
 ### Optional: Install as System Command

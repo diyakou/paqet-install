@@ -164,7 +164,7 @@ resolve_paqet_binary() {
 
 # Get latest paqet release tag from GitHub API
 get_latest_paqet_version() {
-    local api_url="https://api.github.com/repos/hanselime/paqet/releases/latest"
+    local api_url="https://api.github.com/repos/diyakou/paqet/releases/latest"
     local version=""
 
     if command -v curl &> /dev/null; then
@@ -624,14 +624,23 @@ download_paqet_binary() {
             paqet_arch="arm64"
             ;;
         armv7l|armhf)
-            paqet_arch="armv7"
+            paqet_arch="arm32"
             ;;
-        i386|i686)
-            paqet_arch="i686"
+        mips)
+            paqet_arch="mips"
+            ;;
+        mipsel|mipsle)
+            paqet_arch="mipsle"
+            ;;
+        mips64)
+            paqet_arch="mips64"
+            ;;
+        mips64el|mips64le)
+            paqet_arch="mips64le"
             ;;
         *)
             print_error "Unsupported architecture: $arch"
-            print_info "Please download manually from: https://github.com/hanselime/paqet/releases"
+            print_info "Please download manually from: https://github.com/diyakou/paqet/releases"
             return 1
             ;;
     esac
@@ -649,14 +658,14 @@ download_paqet_binary() {
             print_info "Please check internet access and try again"
             return 1
         fi
-        version="v1.0.0-alpha.11"
+        version="v1.0.0-optimized"
         print_warning "Could not fetch latest version, using fallback: $version"
     else
         print_info "Latest version: $version"
     fi
 
     local filename="paqet-linux-${paqet_arch}-${version}.tar.gz"
-    local download_url="https://github.com/hanselime/paqet/releases/download/$version/$filename"
+    local download_url="https://github.com/diyakou/paqet/releases/download/$version/$filename"
 
     print_info "Downloading from: $download_url"
 
@@ -678,7 +687,7 @@ download_paqet_binary() {
 
     if [ $? -ne 0 ]; then
         print_error "Download failed. Please download manually from:"
-        print_info "https://github.com/hanselime/paqet/releases"
+        print_info "https://github.com/diyakou/paqet/releases"
         rm -rf "$temp_dir"
         return 1
     fi
@@ -1298,7 +1307,7 @@ create_systemd_service() {
 [Unit]
 Description=Paqet Tunnel ($mode)
 After=network.target
-Documentation=https://github.com/hanselime/paqet
+Documentation=https://github.com/diyakou/paqet
 
 [Service]
 Type=simple
