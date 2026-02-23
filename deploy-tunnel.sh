@@ -200,6 +200,336 @@ apply_kcp_preset() {
     esac
 }
 
+is_yes() {
+    local value
+    value=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    [ "$value" = "yes" ] || [ "$value" = "y" ]
+}
+
+clamp_int() {
+    local value="$1"
+    local min="$2"
+    local max="$3"
+
+    if [ "$value" -lt "$min" ]; then
+        echo "$min"
+    elif [ "$value" -gt "$max" ]; then
+        echo "$max"
+    else
+        echo "$value"
+    fi
+}
+
+detect_system_resources() {
+    local cores=""
+    local mem_kb=""
+    local mem_mb=""
+
+    if command -v nproc >/dev/null 2>&1; then
+        cores=$(nproc 2>/dev/null)
+    fi
+    if ! [[ "$cores" =~ ^[0-9]+$ ]] || [ "$cores" -le 0 ]; then
+        cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null)
+    fi
+    if ! [[ "$cores" =~ ^[0-9]+$ ]] || [ "$cores" -le 0 ]; then
+        cores=1
+    fi
+
+    if [ -r /proc/meminfo ]; then
+        mem_kb=$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo)
+    fi
+    if ! [[ "$mem_kb" =~ ^[0-9]+$ ]] || [ "$mem_kb" -le 0 ]; then
+        mem_kb=1048576
+    fi
+    mem_mb=$((mem_kb / 1024))
+    if [ "$mem_mb" -le 0 ]; then
+        mem_mb=1024
+    fi
+
+    SYSTEM_CPU_CORES="$cores"
+    SYSTEM_RAM_MB="$mem_mb"
+
+    if [ "$SYSTEM_RAM_MB" -lt 1024 ] || [ "$SYSTEM_CPU_CORES" -le 1 ]; then
+        RESOURCE_TIER="tiny"
+    elif [ "$SYSTEM_RAM_MB" -lt 2048 ] || [ "$SYSTEM_CPU_CORES" -le 2 ]; then
+        RESOURCE_TIER="small"
+    elif [ "$SYSTEM_RAM_MB" -lt 4096 ] || [ "$SYSTEM_CPU_CORES" -le 3 ]; then
+        RESOURCE_TIER="medium"
+    elif [ "$SYSTEM_RAM_MB" -ge 8192 ] && [ "$SYSTEM_CPU_CORES" -ge 6 ]; then
+        RESOURCE_TIER="xlarge"
+    else
+        RESOURCE_TIER="large"
+    fi
+}
+
+apply_resource_aware_tuning() {
+    local role="$1"
+    local conn_cap=3
+
+    case "$RESOURCE_TIER" in
+        tiny)
+            conn_cap=2
+            KCP_INTERVAL=30
+            KCP_NODELAY=0
+            KCP_RCVWND=$(clamp_int "$KCP_RCVWND" 512 2048)
+            KCP_SNDWND=$(clamp_int "$KCP_SNDWND" 512 2048)
+            KCP_SMUXBUF=$(clamp_int "$KCP_SMUXBUF" 1048576 4194304)
+            KCP_STREAMBUF=$(clamp_int "$KCP_STREAMBUF" 524288 2097152)
+            CLIENT_PCAP_SOCKBUF=$(clamp_int "$CLIENT_PCAP_SOCKBUF" 2097152 4194304)
+            SERVER_PCAP_SOCKBUF=$(clamp_int "$SERVER_PCAP_SOCKBUF" 4194304 6291456)
+            ;;
+        small)
+            conn_cap=3
+            KCP_INTERVAL=$(clamp_int "$KCP_INTERVAL" 20 30)
+            KCP_RCVWND=$(clamp_int "$KCP_RCVWND" 1024 4096)
+            KCP_SNDWND=$(clamp_int "$KCP_SNDWND" 1024 4096)
+            KCP_SMUXBUF=$(clamp_int "$KCP_SMUXBUF" 2097152 8388608)
+            KCP_STREAMBUF=$(clamp_int "$KCP_STREAMBUF" 1048576 4194304)
+            ;;
+        medium)
+            conn_cap=4
+            ;;
+        large)
+            conn_cap=6
+            if [ "$role" = "server" ] && [ "$MAX_ONLINE_USERS" -ge 300 ]; then
+                KCP_RCVWND=$(clamp_int "$KCP_RCVWND" 4096 8192)
+                KCP_SNDWND=$(clamp_int "$KCP_SNDWND" 4096 8192)
+            fi
+            ;;
+        xlarge)
+            conn_cap=8
+            if [ "$role" = "server" ] && [ "$MAX_ONLINE_USERS" -ge 300 ]; then
+                KCP_RCVWND=$(clamp_int "$KCP_RCVWND" 6144 12288)
+                KCP_SNDWND=$(clamp_int "$KCP_SNDWND" 6144 12288)
+                KCP_SMUXBUF=$(clamp_int "$KCP_SMUXBUF" 8388608 33554432)
+                KCP_STREAMBUF=$(clamp_int "$KCP_STREAMBUF" 4194304 16777216)
+            fi
+            ;;
+        *)
+            conn_cap=4
+            ;;
+    esac
+
+    if ! [[ "$CONN_COUNT" =~ ^[0-9]+$ ]] || [ "$CONN_COUNT" -le 0 ]; then
+        CONN_COUNT=3
+    fi
+    CONN_COUNT=$(clamp_int "$CONN_COUNT" 1 "$conn_cap")
+}
+
+set_smart_tunnel_profile() {
+    local role="$1"
+    local max_users="$2"
+
+    if ! [[ "$max_users" =~ ^[0-9]+$ ]] || [ "$max_users" -le 0 ]; then
+        max_users=50
+    fi
+
+    KCP_MODE="manual"
+    KCP_RESEND=2
+    KCP_NC=1
+
+    if [ "$max_users" -le 20 ]; then
+        SMART_PROFILE_NAME="light"
+        CONN_COUNT="2"
+        MTU="1360"
+        KCP_NODELAY=0
+        KCP_INTERVAL=30
+        if [ "$role" = "server" ]; then
+            KCP_RCVWND=2048
+            KCP_SNDWND=2048
+            SERVER_PCAP_SOCKBUF="6291456"
+        else
+            KCP_RCVWND=1024
+            KCP_SNDWND=1024
+            CLIENT_PCAP_SOCKBUF="3145728"
+        fi
+        KCP_SMUXBUF=2097152
+        KCP_STREAMBUF=1048576
+    elif [ "$max_users" -le 100 ]; then
+        SMART_PROFILE_NAME="balanced"
+        CONN_COUNT="3"
+        MTU="1320"
+        KCP_NODELAY=1
+        KCP_INTERVAL=20
+        if [ "$role" = "server" ]; then
+            KCP_RCVWND=4096
+            KCP_SNDWND=4096
+            SERVER_PCAP_SOCKBUF="8388608"
+        else
+            KCP_RCVWND=2048
+            KCP_SNDWND=2048
+            CLIENT_PCAP_SOCKBUF="4194304"
+        fi
+        KCP_SMUXBUF=4194304
+        KCP_STREAMBUF=2097152
+    elif [ "$max_users" -le 300 ]; then
+        SMART_PROFILE_NAME="high"
+        CONN_COUNT="4"
+        MTU="1280"
+        KCP_NODELAY=1
+        KCP_INTERVAL=15
+        if [ "$role" = "server" ]; then
+            KCP_RCVWND=6144
+            KCP_SNDWND=6144
+            SERVER_PCAP_SOCKBUF="12582912"
+        else
+            KCP_RCVWND=3072
+            KCP_SNDWND=3072
+            CLIENT_PCAP_SOCKBUF="6291456"
+        fi
+        KCP_SMUXBUF=8388608
+        KCP_STREAMBUF=4194304
+    else
+        SMART_PROFILE_NAME="very-high"
+        CONN_COUNT="5"
+        MTU="1240"
+        KCP_NODELAY=1
+        KCP_INTERVAL=10
+        if [ "$role" = "server" ]; then
+            KCP_RCVWND=8192
+            KCP_SNDWND=8192
+            SERVER_PCAP_SOCKBUF="16777216"
+        else
+            KCP_RCVWND=4096
+            KCP_SNDWND=4096
+            CLIENT_PCAP_SOCKBUF="8388608"
+        fi
+        KCP_SMUXBUF=16777216
+        KCP_STREAMBUF=8388608
+    fi
+}
+
+print_smart_profile_summary() {
+    print_success "Smart profile: $SMART_PROFILE_NAME"
+    print_info "Max online users: $MAX_ONLINE_USERS"
+    print_info "System resources: ${SYSTEM_CPU_CORES} vCPU, ${SYSTEM_RAM_MB}MB RAM (${RESOURCE_TIER})"
+    print_info "Auto connection count: $CONN_COUNT"
+    print_info "Auto MTU: $MTU"
+    print_info "Auto KCP mode: $KCP_MODE"
+}
+
+ask_max_online_users_and_apply_profile() {
+    local role="$1"
+    local response=""
+
+    while true; do
+        read -p "Enter expected MAX concurrent online users (default: 50): " response
+        response=$(echo "$response" | tr -d '[:space:]')
+
+        if [ -z "$response" ]; then
+            MAX_ONLINE_USERS="50"
+            break
+        fi
+
+        if [[ "$response" =~ ^[0-9]+$ ]] && [ "$response" -ge 1 ]; then
+            MAX_ONLINE_USERS="$response"
+            break
+        fi
+
+        print_warning "Please enter a valid number (1+)."
+    done
+
+    set_smart_tunnel_profile "$role" "$MAX_ONLINE_USERS"
+    detect_system_resources
+    apply_resource_aware_tuning "$role"
+    print_smart_profile_summary
+}
+
+ask_post_install_options() {
+    local response=""
+    APPLY_KERNEL_OPTIMIZATION="no"
+    APPLY_KERNEL_UPGRADE="no"
+    EDIT_CONNECTION_SECTION="no"
+
+    echo -e "\n${YELLOW}Optional system actions:${NC}"
+    read -p "Apply kernel/OS tunnel optimizations now? (yes/no, default: no): " response
+    if is_yes "$response"; then
+        APPLY_KERNEL_OPTIMIZATION="yes"
+    fi
+
+    response=""
+    read -p "Attempt OS kernel package upgrade too? (yes/no, default: no): " response
+    if is_yes "$response"; then
+        APPLY_KERNEL_UPGRADE="yes"
+    fi
+
+    response=""
+    read -p "After config is generated, edit connection section before start? (yes/no, default: no): " response
+    if is_yes "$response"; then
+        EDIT_CONNECTION_SECTION="yes"
+    fi
+}
+
+run_kernel_upgrade() {
+    print_header "Kernel Package Upgrade"
+    print_warning "Kernel upgrade may take time and can require reboot."
+
+    if [ -f /etc/debian_version ]; then
+        apt-get update -qq
+        apt-get install -y --install-recommends linux-generic >/dev/null 2>&1 || \
+        apt-get install -y linux-image-amd64 linux-headers-amd64 >/dev/null 2>&1
+    elif [ -f /etc/redhat-release ]; then
+        if command -v dnf >/dev/null 2>&1; then
+            dnf -y upgrade kernel kernel-core kernel-modules >/dev/null 2>&1
+        else
+            yum -y update kernel kernel-core kernel-modules >/dev/null 2>&1
+        fi
+    elif [ -f /etc/arch-release ]; then
+        pacman -Syu --noconfirm linux linux-headers >/dev/null 2>&1
+    else
+        print_warning "Unsupported distro for automatic kernel upgrade; skipped."
+        return 0
+    fi
+
+    if [ $? -eq 0 ]; then
+        print_success "Kernel package upgrade completed."
+        print_info "Reboot is recommended to boot into the new kernel."
+    else
+        print_warning "Kernel package upgrade failed or partially completed."
+    fi
+}
+
+run_selected_system_actions() {
+    if [ "$APPLY_KERNEL_OPTIMIZATION" = "yes" ]; then
+        optimize_kernel
+    fi
+
+    if [ "$APPLY_KERNEL_UPGRADE" = "yes" ]; then
+        run_kernel_upgrade
+    fi
+}
+
+offer_connection_section_edit() {
+    local config_file="$1"
+    local mode="$2"
+
+    if [ "$EDIT_CONNECTION_SECTION" != "yes" ]; then
+        return
+    fi
+
+    print_header "Edit Connection Section"
+    if [ "$mode" = "client" ]; then
+        print_info "Review/edit these sections in config:"
+        print_info "  server.addr"
+        print_info "  transport.conn"
+        print_info "  transport.kcp.*"
+    else
+        print_info "Review/edit these sections in config:"
+        print_info "  listen.addr"
+        print_info "  network.ipv4.addr"
+        print_info "  transport.conn"
+        print_info "  transport.kcp.*"
+    fi
+
+    local editor="${EDITOR:-nano}"
+    if ! command -v "$editor" >/dev/null 2>&1; then
+        editor="vi"
+    fi
+
+    print_info "Opening $config_file with editor: $editor"
+    "$editor" "$config_file"
+}
+
 # Detect if a path is the deployment script (not the paqet binary)
 is_script_paqet() {
     local path="$1"
@@ -1829,6 +2159,7 @@ deploy_paqet() {
     # Check prerequisites
     check_root
     install_dependencies
+    run_selected_system_actions
     
     # Download paqet binary if needed
     download_paqet_binary || exit 1
@@ -1844,10 +2175,17 @@ deploy_paqet() {
     # Create configuration
     if [ "$MODE" = "server" ]; then
         create_server_config "$config_file"
+        offer_connection_section_edit "$config_file" "server"
+        local updated_port
+        updated_port=$(extract_tunnel_port_from_config "$config_file")
+        if [ -n "$updated_port" ]; then
+            SERVER_PORT="$updated_port"
+        fi
         setup_firewall_rules "$SERVER_PORT"
     else
         validate_forward_rules || exit 1
         create_client_config "$config_file"
+        offer_connection_section_edit "$config_file" "client"
     fi
     
     # Validate configuration
@@ -1899,6 +2237,8 @@ deploy_paqet() {
     fi
     print_success "Configuration: $config_file"
     print_success "Service: $service_name"
+    print_success "Smart Profile: $SMART_PROFILE_NAME (${MAX_ONLINE_USERS} max users)"
+    print_info "Resource Tier: $RESOURCE_TIER (${SYSTEM_CPU_CORES} vCPU, ${SYSTEM_RAM_MB}MB RAM)"
     print_info "Encryption Key: $ENCRYPTION_KEY"
     echo ""
     
@@ -1952,9 +2292,17 @@ FORWARD_PORTS=""  # User input format: "443=443,8443=8080"
 ENCRYPTION_KEY=""
 PAQET_PATH="."
 PAQET_REPO="diyakou/paqet"
-KCP_MODE="fast2"
+KCP_MODE="manual"
 CONN_COUNT="3"
 MTU="1280"
+MAX_ONLINE_USERS="50"
+SMART_PROFILE_NAME="balanced"
+SYSTEM_CPU_CORES="1"
+SYSTEM_RAM_MB="1024"
+RESOURCE_TIER="small"
+APPLY_KERNEL_OPTIMIZATION="no"
+APPLY_KERNEL_UPGRADE="no"
+EDIT_CONNECTION_SECTION="no"
 KCP_NODELAY=1
 KCP_INTERVAL=20
 KCP_RESEND=2
@@ -2214,55 +2562,8 @@ get_single_tunnel_input() {
             echo -e "  ${GREEN}SOCKS5 proxy will be available at 127.0.0.1:1080${NC}"
         fi
         
-        # Get KCP Configuration
-        echo -e "\n${YELLOW}KCP Configuration (Connection Tuning):${NC}"
-        echo -e "  Default connections: 3 (Balanced, lower bandwidth overhead)"
-        read -p "Enter number of parallel connections (default: 3): " response
-        if [ -n "$response" ]; then
-            CONN_COUNT=$(echo "$response" | tr -d '[:space:]')
-        fi
-
-        echo -e "\n  Performance Modes:"
-        echo -e "  ${WHITE}1) fast${NC}"
-        echo -e "  ${WHITE}2) fast2 (More aggressive)${NC}"
-        echo -e "  ${WHITE}3) fast3 (Most aggressive - very high bandwidth usage)${NC}"
-        echo -e "  ${WHITE}4) manual (Custom low-level parameters)${NC}"
-        read -p "Choose KCP mode (1-4, default: 2): " kcpResponse
-        
-        case "$kcpResponse" in
-            1) KCP_MODE="fast" ;;
-            2) KCP_MODE="fast2" ;;
-            3) KCP_MODE="fast3" ;;
-            4) KCP_MODE="manual" ;;
-            *) KCP_MODE="fast2" ;;
-        esac
-        echo -e "  ${GREEN}Selected Mode: $KCP_MODE${NC}"
-
-        if [ "$KCP_MODE" = "manual" ]; then
-            echo -e "\n${YELLOW}Manual Presets:${NC}"
-            echo -e "  ${WHITE}1) Normal (Balanced)${NC}"
-            echo -e "  ${WHITE}2) Gaming (Low latency)${NC}"
-            echo -e "  ${WHITE}3) Streaming/Downloading (High throughput)${NC}"
-            read -p "Choose manual preset (1-3, default: 1): " presetResponse
-            case "$presetResponse" in
-                2) apply_kcp_preset "gaming" "client" ;;
-                3) apply_kcp_preset "streaming" "client" ;;
-                *) apply_kcp_preset "normal" "client" ;;
-            esac
-            echo -e "  ${GREEN}Manual preset applied.${NC}"
-        else
-            apply_kcp_mode_defaults "client" "$KCP_MODE"
-        fi
-
-        # Get MTU
-        echo -e "\n${YELLOW}MTU Configuration:${NC}"
-        echo -e "  Default: 1280 (Recommended for most networks)"
-        echo -e "  Lower values (1200-1300) may help with unstable connections"
-        read -p "Enter MTU value (default: 1280): " response
-        if [ -n "$response" ]; then
-            MTU=$(echo "$response" | tr -d '[:space:]')
-        fi
-        echo -e "  ${GREEN}MTU: $MTU${NC}"
+        echo -e "\n${YELLOW}Smart Connection Tuning:${NC}"
+        ask_max_online_users_and_apply_profile "client"
 
         # Get encryption key
         echo -e "\n${YELLOW}Encryption Key:${NC}"
@@ -2287,56 +2588,8 @@ get_single_tunnel_input() {
             fi
         fi
         
-        # Get KCP Configuration for server
-        echo -e "\n${YELLOW}KCP Configuration (Connection Tuning):${NC}"
-        echo -e "  Default connections: 3 (Balanced, lower bandwidth overhead)"
-        read -p "Enter number of parallel connections (default: 3): " response
-        if [ -n "$response" ]; then
-            CONN_COUNT=$(echo "$response" | tr -d '[:space:]')
-        fi
-        echo -e "  ${GREEN}Connection count: $CONN_COUNT${NC}"
-        
-        echo -e "\n  Performance Modes:"
-        echo -e "  ${WHITE}1) fast${NC}"
-        echo -e "  ${WHITE}2) fast2 (More aggressive)${NC}"
-        echo -e "  ${WHITE}3) fast3 (Most aggressive - very high bandwidth usage)${NC}"
-        echo -e "  ${WHITE}4) manual (Custom low-level parameters)${NC}"
-        read -p "Choose KCP mode (1-4, default: 2): " kcpResponse
-        
-        case "$kcpResponse" in
-            1) KCP_MODE="fast" ;;
-            2) KCP_MODE="fast2" ;;
-            3) KCP_MODE="fast3" ;;
-            4) KCP_MODE="manual" ;;
-            *) KCP_MODE="fast2" ;;
-        esac
-        echo -e "  ${GREEN}Selected Mode: $KCP_MODE${NC}"
-
-        if [ "$KCP_MODE" = "manual" ]; then
-            echo -e "\n${YELLOW}Manual Presets:${NC}"
-            echo -e "  ${WHITE}1) Normal (Balanced)${NC}"
-            echo -e "  ${WHITE}2) Gaming (Low latency)${NC}"
-            echo -e "  ${WHITE}3) Streaming/Downloading (High throughput)${NC}"
-            read -p "Choose manual preset (1-3, default: 1): " presetResponse
-            case "$presetResponse" in
-                2) apply_kcp_preset "gaming" "server" ;;
-                3) apply_kcp_preset "streaming" "server" ;;
-                *) apply_kcp_preset "normal" "server" ;;
-            esac
-            echo -e "  ${GREEN}Manual preset applied.${NC}"
-        else
-            apply_kcp_mode_defaults "server" "$KCP_MODE"
-        fi
-        
-        # Get MTU for server
-        echo -e "\n${YELLOW}MTU Configuration:${NC}"
-        echo -e "  Default: 1280 (Recommended for most networks)"
-        echo -e "  Lower values (1200-1300) may help with unstable connections"
-        read -p "Enter MTU value (default: 1280): " response
-        if [ -n "$response" ]; then
-            MTU=$(echo "$response" | tr -d '[:space:]')
-        fi
-        echo -e "  ${GREEN}MTU: $MTU${NC}"
+        echo -e "\n${YELLOW}Smart Connection Tuning:${NC}"
+        ask_max_online_users_and_apply_profile "server"
         
         # Generate encryption key NOW and show it
         echo -e "\n${YELLOW}Encryption Key:${NC}"
@@ -2373,55 +2626,8 @@ get_multi_client_input() {
     echo -e "${YELLOW}You will connect this client to multiple Kharej servers.${NC}"
     echo -e "${YELLOW}Each server will have its own tunnel and service.${NC}\n"
     
-    # Get global KCP settings (shared across all tunnels)
-    echo -e "${YELLOW}Global KCP Configuration (applies to all tunnels):${NC}"
-    echo -e "  Default connections: 3 (Balanced, lower bandwidth overhead)"
-    read -p "Enter number of parallel connections (default: 3): " response
-    if [ -n "$response" ]; then
-        CONN_COUNT=$(echo "$response" | tr -d '[:space:]')
-    fi
-    echo -e "  ${GREEN}Connection count: $CONN_COUNT${NC}"
-    
-    echo -e "\n  Performance Modes:"
-    echo -e "  ${WHITE}1) fast${NC}"
-    echo -e "  ${WHITE}2) fast2 (More aggressive)${NC}"
-    echo -e "  ${WHITE}3) fast3 (Most aggressive - very high bandwidth usage)${NC}"
-    echo -e "  ${WHITE}4) manual (Custom low-level parameters)${NC}"
-    read -p "Choose KCP mode (1-4, default: 2): " kcpResponse
-    
-    case "$kcpResponse" in
-        1) KCP_MODE="fast" ;;
-        2) KCP_MODE="fast2" ;;
-        3) KCP_MODE="fast3" ;;
-        4) KCP_MODE="manual" ;;
-        *) KCP_MODE="fast2" ;;
-    esac
-    echo -e "  ${GREEN}Selected Mode: $KCP_MODE${NC}"
-
-    if [ "$KCP_MODE" = "manual" ]; then
-        echo -e "\n${YELLOW}Manual Presets:${NC}"
-        echo -e "  ${WHITE}1) Normal (Balanced)${NC}"
-        echo -e "  ${WHITE}2) Gaming (Low latency)${NC}"
-        echo -e "  ${WHITE}3) Streaming/Downloading (High throughput)${NC}"
-        read -p "Choose manual preset (1-3, default: 1): " presetResponse
-        case "$presetResponse" in
-            2) apply_kcp_preset "gaming" "client" ;;
-            3) apply_kcp_preset "streaming" "client" ;;
-            *) apply_kcp_preset "normal" "client" ;;
-        esac
-        echo -e "  ${GREEN}Manual preset applied.${NC}"
-    else
-        apply_kcp_mode_defaults "client" "$KCP_MODE"
-    fi
-    
-    echo -e "\n${YELLOW}MTU Configuration:${NC}"
-    echo -e "  Default: 1280 (Recommended for most networks)"
-    echo -e "  Lower values (1200-1300) may help with unstable connections"
-    read -p "Enter MTU value (default: 1280): " response
-    if [ -n "$response" ]; then
-        MTU=$(echo "$response" | tr -d '[:space:]')
-    fi
-    echo -e "  ${GREEN}MTU: $MTU${NC}"
+    echo -e "${YELLOW}Smart Connection Tuning (applies to all tunnels):${NC}"
+    ask_max_online_users_and_apply_profile "client"
     
     local tunnel_count=0
     local add_more="yes"
@@ -2518,55 +2724,8 @@ get_multi_server_input() {
     echo -e "${YELLOW}This server will accept connections from multiple Iran clients.${NC}"
     echo -e "${YELLOW}Each client will have its own tunnel, port, and encryption key.${NC}\n"
     
-    # Get global KCP settings (shared across all tunnels)
-    echo -e "${YELLOW}Global KCP Configuration (applies to all tunnels):${NC}"
-    echo -e "  Default connections: 3 (Balanced, lower bandwidth overhead)"
-    read -p "Enter number of parallel connections (default: 3): " response
-    if [ -n "$response" ]; then
-        CONN_COUNT=$(echo "$response" | tr -d '[:space:]')
-    fi
-    echo -e "  ${GREEN}Connection count: $CONN_COUNT${NC}"
-    
-    echo -e "\n  Performance Modes:"
-    echo -e "  ${WHITE}1) fast${NC}"
-    echo -e "  ${WHITE}2) fast2 (More aggressive)${NC}"
-    echo -e "  ${WHITE}3) fast3 (Most aggressive - very high bandwidth usage)${NC}"
-    echo -e "  ${WHITE}4) manual (Custom low-level parameters)${NC}"
-    read -p "Choose KCP mode (1-4, default: 2): " kcpResponse
-    
-    case "$kcpResponse" in
-        1) KCP_MODE="fast" ;;
-        2) KCP_MODE="fast2" ;;
-        3) KCP_MODE="fast3" ;;
-        4) KCP_MODE="manual" ;;
-        *) KCP_MODE="fast2" ;;
-    esac
-    echo -e "  ${GREEN}Selected Mode: $KCP_MODE${NC}"
-
-    if [ "$KCP_MODE" = "manual" ]; then
-        echo -e "\n${YELLOW}Manual Presets:${NC}"
-        echo -e "  ${WHITE}1) Normal (Balanced)${NC}"
-        echo -e "  ${WHITE}2) Gaming (Low latency)${NC}"
-        echo -e "  ${WHITE}3) Streaming/Downloading (High throughput)${NC}"
-        read -p "Choose manual preset (1-3, default: 1): " presetResponse
-        case "$presetResponse" in
-            2) apply_kcp_preset "gaming" "server" ;;
-            3) apply_kcp_preset "streaming" "server" ;;
-            *) apply_kcp_preset "normal" "server" ;;
-        esac
-        echo -e "  ${GREEN}Manual preset applied.${NC}"
-    else
-        apply_kcp_mode_defaults "server" "$KCP_MODE"
-    fi
-    
-    echo -e "\n${YELLOW}MTU Configuration:${NC}"
-    echo -e "  Default: 1280 (Recommended for most networks)"
-    echo -e "  Lower values (1200-1300) may help with unstable connections"
-    read -p "Enter MTU value (default: 1280): " response
-    if [ -n "$response" ]; then
-        MTU=$(echo "$response" | tr -d '[:space:]')
-    fi
-    echo -e "  ${GREEN}MTU: $MTU${NC}"
+    echo -e "${YELLOW}Smart Connection Tuning (applies to all tunnels):${NC}"
+    ask_max_online_users_and_apply_profile "server"
     
     local tunnel_count=0
     local add_more="yes"
@@ -2637,6 +2796,7 @@ deploy_multi_tunnels() {
     # Check prerequisites first
     check_root
     install_dependencies
+    run_selected_system_actions
     download_paqet_binary || exit 1
     get_network_details
     
@@ -2655,11 +2815,24 @@ deploy_multi_tunnels() {
 
             validate_forward_rules || return 1
             create_client_config "$config_file"
+            offer_connection_section_edit "$config_file" "client"
+            local updated_port
+            updated_port=$(extract_tunnel_port_from_config "$config_file")
+            if [ -n "$updated_port" ]; then
+                TUNNEL_PORTS[$i]="$updated_port"
+            fi
         else
             SERVER_PORT="${TUNNEL_PORTS[$i]}"
             ENCRYPTION_KEY="${TUNNEL_KEYS[$i]}"
             
             create_server_config "$config_file"
+            offer_connection_section_edit "$config_file" "server"
+            local updated_port
+            updated_port=$(extract_tunnel_port_from_config "$config_file")
+            if [ -n "$updated_port" ]; then
+                SERVER_PORT="$updated_port"
+                TUNNEL_PORTS[$i]="$updated_port"
+            fi
             setup_firewall_rules "$SERVER_PORT"
         fi
         
@@ -2690,6 +2863,8 @@ deploy_multi_tunnels() {
     
     # Print final summary
     print_header "Multi-Tunnel Deployment Summary"
+    print_info "Smart Profile: $SMART_PROFILE_NAME (${MAX_ONLINE_USERS} max users)"
+    print_info "Resource Tier: $RESOURCE_TIER (${SYSTEM_CPU_CORES} vCPU, ${SYSTEM_RAM_MB}MB RAM)"
     echo -e "Total tunnels deployed: ${#TUNNEL_NAMES[@]}\n"
     
     for i in "${!TUNNEL_NAMES[@]}"; do
@@ -2758,6 +2933,7 @@ show_main_menu() {
                 fi
             done
             get_single_tunnel_input
+            ask_post_install_options
             
             # Confirm
             echo -e "\n${CYAN}============================================${NC}"
@@ -2785,6 +2961,7 @@ show_main_menu() {
             # Multi-server client
             MODE="client"
             get_multi_client_input
+            ask_post_install_options
             
             # Confirm
             echo -e "\n${CYAN}============================================${NC}"
@@ -2803,6 +2980,7 @@ show_main_menu() {
             # Multi-client server
             MODE="server"
             get_multi_server_input
+            ask_post_install_options
             
             # Confirm
             echo -e "\n${CYAN}============================================${NC}"
