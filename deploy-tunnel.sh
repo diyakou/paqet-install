@@ -435,6 +435,100 @@ ask_max_online_users_and_apply_profile() {
     print_smart_profile_summary
 }
 
+prompt_max_online_users_value() {
+    local response=""
+    while true; do
+        read -p "Enter expected MAX concurrent online users (default: 50): " response
+        response=$(echo "$response" | tr -d '[:space:]')
+
+        if [ -z "$response" ]; then
+            MAX_ONLINE_USERS="50"
+            return
+        fi
+
+        if [[ "$response" =~ ^[0-9]+$ ]] && [ "$response" -ge 1 ]; then
+            MAX_ONLINE_USERS="$response"
+            return
+        fi
+
+        print_warning "Please enter a valid number (1+)."
+    done
+}
+
+apply_smart_profile_to_existing_config() {
+    local config_file="$1"
+    local role="$2"
+
+    [ -f "$config_file" ] || return 1
+
+    set_smart_tunnel_profile "$role" "$MAX_ONLINE_USERS"
+    apply_resource_aware_tuning "$role"
+
+    sed -i -E "s|^([[:space:]]*conn:[[:space:]]*)[0-9]+|\1$CONN_COUNT|" "$config_file"
+    sed -i -E "s|^([[:space:]]*mode:[[:space:]]*)\"[^\"]+\"|\1\"$KCP_MODE\"|" "$config_file"
+    sed -i -E "s|^([[:space:]]*mtu:[[:space:]]*)[0-9]+|\1$MTU|" "$config_file"
+    sed -i -E "s|^([[:space:]]*nodelay:[[:space:]]*)[0-9]+|\1$KCP_NODELAY|" "$config_file"
+    sed -i -E "s|^([[:space:]]*interval:[[:space:]]*)[0-9]+|\1$KCP_INTERVAL|" "$config_file"
+    sed -i -E "s|^([[:space:]]*resend:[[:space:]]*)[0-9]+|\1$KCP_RESEND|" "$config_file"
+    sed -i -E "s|^([[:space:]]*nocongestion:[[:space:]]*)[0-9]+|\1$KCP_NC|" "$config_file"
+    sed -i -E "s|^([[:space:]]*rcvwnd:[[:space:]]*)[0-9]+|\1$KCP_RCVWND|" "$config_file"
+    sed -i -E "s|^([[:space:]]*sndwnd:[[:space:]]*)[0-9]+|\1$KCP_SNDWND|" "$config_file"
+    sed -i -E "s|^([[:space:]]*smuxbuf:[[:space:]]*)[0-9]+|\1$KCP_SMUXBUF|" "$config_file"
+    sed -i -E "s|^([[:space:]]*streambuf:[[:space:]]*)[0-9]+|\1$KCP_STREAMBUF|" "$config_file"
+    if [ "$role" = "server" ]; then
+        sed -i -E "s|^([[:space:]]*sockbuf:[[:space:]]*)[0-9]+|\1$SERVER_PCAP_SOCKBUF|" "$config_file"
+    else
+        sed -i -E "s|^([[:space:]]*sockbuf:[[:space:]]*)[0-9]+|\1$CLIENT_PCAP_SOCKBUF|" "$config_file"
+    fi
+
+    return 0
+}
+
+retune_existing_tunnels_interactive() {
+    local response=""
+    read -p "Retune existing tunnel configs based on max online users? (yes/no, default: yes): " response
+    response=$(echo "$response" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [ -n "$response" ] && [ "$response" != "yes" ] && [ "$response" != "y" ]; then
+        return 0
+    fi
+
+    prompt_max_online_users_value
+    detect_system_resources
+
+    local updated=0
+    local service_file=""
+    for service_file in /etc/systemd/system/paqet-*.service; do
+        [ -f "$service_file" ] || continue
+
+        local service_name
+        local config_file
+        local role
+        service_name=$(basename "$service_file" .service)
+        config_file=$(resolve_service_config_path "$service_file")
+        [ -n "$config_file" ] && [ -f "$config_file" ] || continue
+
+        if grep -q 'role:[[:space:]]*"server"' "$config_file"; then
+            role="server"
+        else
+            role="client"
+        fi
+
+        if apply_smart_profile_to_existing_config "$config_file" "$role"; then
+            print_success "Retuned $service_name ($role) -> $config_file"
+            systemctl restart "$service_name" >/dev/null 2>&1 && \
+                print_info "Restarted $service_name" || \
+                print_warning "Could not restart $service_name; restart it manually."
+            updated=$((updated + 1))
+        fi
+    done
+
+    if [ "$updated" -eq 0 ]; then
+        print_warning "No existing paqet tunnel configs found to retune."
+    else
+        print_success "Retuned $updated tunnel config(s) using $MAX_ONLINE_USERS max users and $RESOURCE_TIER resource tier."
+    fi
+}
+
 ask_post_install_options() {
     local response=""
     APPLY_KERNEL_OPTIMIZATION="no"
@@ -3090,6 +3184,7 @@ show_optimization_menu() {
         case "$choice" in
             1) 
                 optimize_kernel
+                retune_existing_tunnels_interactive
                 read -p "Press Enter to continue..."
                 ;;
             2) 
